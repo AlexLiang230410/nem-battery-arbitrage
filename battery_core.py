@@ -11,7 +11,96 @@ notebooks or other scripts. They do not depend on Google Colab.
 
 from typing import Dict, Any, Iterable, Tuple
 
+import numpy as np
 import pandas as pd
+
+# Optional progress bar support. If tqdm is not available, we fall back
+# to a no-op wrapper so that code still runs without errors.
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable=None, total=None, desc=None):
+        return iterable if iterable is not None else range(0)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper: fast revenue-only simulation using NumPy arrays
+# ---------------------------------------------------------------------------
+
+
+def _simulate_revenue_only(
+    prices: np.ndarray,
+    dt_hours: float,
+    power_mw: float,
+    energy_mwh: float,
+    charge_threshold: float,
+    discharge_threshold: float,
+    efficiency: float,
+) -> float:
+    """
+    Fast internal helper that simulates the battery strategy and returns only
+    the total revenue. This avoids allocating large arrays or DataFrames and
+    is therefore much faster when used inside grid search loops.
+
+    Args:
+        prices: 1D NumPy array of prices ($/MWh).
+        dt_hours: Time step length in hours.
+        power_mw: Maximum charging/discharging power in MW.
+        energy_mwh: Battery energy capacity in MWh.
+        charge_threshold: Charge when price <= this value.
+        discharge_threshold: Discharge when price >= this value.
+        efficiency: Round-trip efficiency (0-1), applied on charging.
+
+    Returns:
+        Total revenue over the entire time horizon (AUD).
+    """
+    soc = 0.0
+    total_revenue = 0.0
+
+    for price in prices:
+        action_charge = price <= charge_threshold
+        action_discharge = price >= discharge_threshold
+
+        grid_power_mw = 0.0
+
+        # Maximum feasible charge/discharge power based on SoC constraints
+        if energy_mwh > 0.0:
+            max_charge_mw = (energy_mwh - soc) / dt_hours
+            max_charge_mw = max(max_charge_mw, 0.0)
+        else:
+            max_charge_mw = 0.0
+
+        max_discharge_mw = soc / dt_hours
+        max_discharge_mw = max(max_discharge_mw, 0.0)
+
+        if action_charge and max_charge_mw > 0.0:
+            # Charge
+            battery_charge_mw = min(power_mw, max_charge_mw)
+            grid_power_mw = -battery_charge_mw
+            stored_energy_mwh = battery_charge_mw * dt_hours * efficiency
+            soc += stored_energy_mwh
+
+        elif action_discharge and max_discharge_mw > 0.0:
+            # Discharge
+            discharge_mw = min(power_mw, max_discharge_mw)
+            grid_power_mw = discharge_mw
+            discharged_energy_mwh = discharge_mw * dt_hours
+            soc -= discharged_energy_mwh
+
+        # Clamp SoC
+        if soc < 0.0:
+            soc = 0.0
+        elif soc > energy_mwh:
+            soc = energy_mwh
+
+        total_revenue += price * grid_power_mw * dt_hours
+
+    return float(total_revenue)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def simulate_arbitrage(
@@ -22,6 +111,7 @@ def simulate_arbitrage(
     charge_threshold: float,
     discharge_threshold: float,
     efficiency: float,
+    show_progress: bool = False,
 ) -> pd.DataFrame:
     """
     Simulate a simple threshold-based arbitrage strategy for a single battery.
@@ -42,6 +132,8 @@ def simulate_arbitrage(
         charge_threshold: Charge when price is less than or equal to this value ($/MWh).
         discharge_threshold: Discharge when price is greater than or equal to this value ($/MWh).
         efficiency: Round-trip efficiency (0-1). Implemented as an efficiency loss on charging.
+        show_progress: If True, display a progress bar when iterating over time steps.
+            This is mainly useful for very long time series.
 
     Returns:
         A new DataFrame with the original 'price' column and additional columns:
@@ -65,20 +157,31 @@ def simulate_arbitrage(
 
     dt_hours = dt_mins / 60.0
 
-    soc = 0.0  # MWh
-    actions = []
-    powers = []
-    socs = []
-    revenues = []
+    # Use NumPy array for fast iteration instead of DataFrame.iterrows()
+    prices = price_df["price"].to_numpy(dtype=float)
+    n_steps = prices.shape[0]
 
-    for _, row in price_df.iterrows():
-        price = float(row["price"])
+    soc = 0.0  # MWh
+    actions: list[str] = []
+    powers: list[float] = []
+    socs: list[float] = []
+    revenues: list[float] = []
+
+    iterator = range(n_steps)
+    if show_progress and n_steps > 50_000:
+        iterator = tqdm(iterator, total=n_steps, desc="Simulating arbitrage")
+
+    for i in iterator:
+        price = prices[i]
         action = "idle"
         grid_power_mw = 0.0  # positive = discharge, negative = charge
 
         # Maximum feasible charge/discharge power based on SoC constraints
-        max_charge_mw = (energy_mwh - soc) / dt_hours if energy_mwh > 0 else 0.0
-        max_charge_mw = max(max_charge_mw, 0.0)
+        if energy_mwh > 0.0:
+            max_charge_mw = (energy_mwh - soc) / dt_hours
+            max_charge_mw = max(max_charge_mw, 0.0)
+        else:
+            max_charge_mw = 0.0
 
         max_discharge_mw = soc / dt_hours
         max_discharge_mw = max(max_discharge_mw, 0.0)
@@ -86,11 +189,8 @@ def simulate_arbitrage(
         if price <= charge_threshold and max_charge_mw > 0.0:
             # Charge
             action = "charge"
-            # Battery-side charging power (MW)
             battery_charge_mw = min(power_mw, max_charge_mw)
-            # Grid sees negative power while charging
             grid_power_mw = -battery_charge_mw
-            # Apply efficiency on charging: only a fraction of input energy is stored
             stored_energy_mwh = battery_charge_mw * dt_hours * efficiency
             soc += stored_energy_mwh
 
@@ -99,14 +199,13 @@ def simulate_arbitrage(
             action = "discharge"
             discharge_mw = min(power_mw, max_discharge_mw)
             grid_power_mw = discharge_mw
-            # Energy taken from the battery (no additional loss modeled on discharge)
             discharged_energy_mwh = discharge_mw * dt_hours
             soc -= discharged_energy_mwh
 
-        # Enforce numeric bounds on SoC
+        # Clamp SoC
         if soc < 0.0:
             soc = 0.0
-        if soc > energy_mwh:
+        elif soc > energy_mwh:
             soc = energy_mwh
 
         revenue = price * grid_power_mw * dt_hours
@@ -202,6 +301,7 @@ def run_scenarios(
     dt_mins: float,
     scenarios: Dict[str, Dict[str, Any]],
     print_each_summary: bool = False,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """
     Run multiple battery arbitrage scenarios and compare their performance.
@@ -213,6 +313,7 @@ def run_scenarios(
             containing the parameters:
             'power_mw', 'energy_mwh', 'charge_threshold', 'discharge_threshold', 'efficiency'.
         print_each_summary: If True, print a summary for each scenario.
+        show_progress: If True and multiple scenarios are provided, show a progress bar.
 
     Returns:
         A DataFrame where each row corresponds to one scenario and columns are
@@ -220,7 +321,12 @@ def run_scenarios(
     """
     all_summaries: Dict[str, Dict[str, float]] = {}
 
-    for name, params in scenarios.items():
+    items = list(scenarios.items())
+    iterator = items
+    if show_progress and len(items) > 1:
+        iterator = tqdm(items, total=len(items), desc="Running scenarios")
+
+    for name, params in iterator:
         required_keys = {
             "power_mw",
             "energy_mwh",
@@ -242,6 +348,7 @@ def run_scenarios(
             charge_threshold=params["charge_threshold"],
             discharge_threshold=params["discharge_threshold"],
             efficiency=params["efficiency"],
+            show_progress=False,
         )
 
         summary = summarize_performance(
@@ -268,12 +375,18 @@ def grid_search_thresholds(
     charge_threshold_range: Iterable[float],
     discharge_threshold_range: Iterable[float],
     efficiency: float,
+    show_progress: bool = True,
+    min_spread: float = 0.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Perform a grid search over charge and discharge thresholds.
 
     For each combination where charge_threshold < discharge_threshold,
     this function runs a simulation and records the total revenue.
+
+    Compared with the naïve implementation, this version uses a fast
+    internal helper that only computes total revenue, which makes the
+    search significantly faster.
 
     Args:
         price_df: DataFrame with a DateTimeIndex and a 'price' column.
@@ -283,6 +396,11 @@ def grid_search_thresholds(
         charge_threshold_range: Iterable of charge threshold candidates.
         discharge_threshold_range: Iterable of discharge threshold candidates.
         efficiency: Round-trip efficiency (0-1).
+        show_progress: If True, display a progress bar from 0% to 100%.
+        min_spread: Optional minimum spread between discharge and charge
+            thresholds (discharge_threshold - charge_threshold >= min_spread).
+            This can be used to prune nearly identical strategies and
+            reduce the search space.
 
     Returns:
         A tuple of:
@@ -295,43 +413,49 @@ def grid_search_thresholds(
                   'total_revenue': ...
               }
     """
-    records = []
+    dt_hours = dt_mins / 60.0
+    prices = price_df["price"].to_numpy(dtype=float)
 
+    # Build list of valid combinations up front (for progress bar)
+    combos: list[Tuple[float, float]] = []
     for ct in charge_threshold_range:
         for dt_ in discharge_threshold_range:
             if ct >= dt_:
                 continue
+            if min_spread > 0.0 and (dt_ - ct) < min_spread:
+                continue
+            combos.append((float(ct), float(dt_)))
 
-            result = simulate_arbitrage(
-                price_df=price_df,
-                dt_mins=dt_mins,
-                power_mw=power_mw,
-                energy_mwh=energy_mwh,
-                charge_threshold=float(ct),
-                discharge_threshold=float(dt_),
-                efficiency=efficiency,
-            )
-
-            summary = summarize_performance(
-                result_df=result,
-                dt_mins=dt_mins,
-                power_mw=power_mw,
-                energy_mwh=energy_mwh,
-                print_summary=False,
-            )
-
-            records.append(
-                {
-                    "charge_threshold": float(ct),
-                    "discharge_threshold": float(dt_),
-                    "total_revenue": summary["total_revenue"],
-                }
-            )
-
-    if not records:
+    if not combos:
         raise ValueError(
             "No valid threshold combinations were evaluated. "
-            "Check that your ranges are not empty and allow charge_threshold < discharge_threshold."
+            "Check that your ranges are not empty and allow "
+            "charge_threshold < discharge_threshold (and min_spread if set)."
+        )
+
+    records: list[Dict[str, float]] = []
+
+    iterator = combos
+    if show_progress and len(combos) > 1:
+        iterator = tqdm(iterator, total=len(combos), desc="Grid search")
+
+    for ct, dt_ in iterator:
+        total_revenue = _simulate_revenue_only(
+            prices=prices,
+            dt_hours=dt_hours,
+            power_mw=power_mw,
+            energy_mwh=energy_mwh,
+            charge_threshold=ct,
+            discharge_threshold=dt_,
+            efficiency=efficiency,
+        )
+
+        records.append(
+            {
+                "charge_threshold": ct,
+                "discharge_threshold": dt_,
+                "total_revenue": total_revenue,
+            }
         )
 
     grid_search_df = pd.DataFrame.from_records(records)
@@ -355,6 +479,8 @@ def adaptive_threshold_search(
     charge_threshold_range: Iterable[float],
     discharge_threshold_range: Iterable[float],
     efficiency: float,
+    show_progress: bool = True,
+    min_spread: float = 0.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Placeholder for a more advanced threshold search algorithm.
@@ -377,6 +503,8 @@ def adaptive_threshold_search(
         charge_threshold_range: Iterable of charge threshold candidates.
         discharge_threshold_range: Iterable of discharge threshold candidates.
         efficiency: Round-trip efficiency (0-1).
+        show_progress: If True, display a progress bar from 0% to 100%.
+        min_spread: Optional minimum spread between thresholds.
 
     Returns:
         Same as grid_search_thresholds.
@@ -389,4 +517,6 @@ def adaptive_threshold_search(
         charge_threshold_range=charge_threshold_range,
         discharge_threshold_range=discharge_threshold_range,
         efficiency=efficiency,
+        show_progress=show_progress,
+        min_spread=min_spread,
     )
